@@ -9,10 +9,12 @@ use hyper::{Body, Response};
 use lazy_static::lazy_static;
 use nostr::event::tag::TagKind;
 use nostr::key::{FromSkStr, Keys};
-use nostr::{EventBuilder, Kind, Tag};
+use nostr::secp256k1::{Message, Secp256k1};
+use nostr::{EventId, Kind, Tag, Timestamp};
 use regex::Regex;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
+use tokio::sync::Mutex;
 use tracing::warn;
 
 pub const VISIT_KIND: u64 = 20918;
@@ -31,6 +33,7 @@ const PIXEL_PNG: [u8; 68] = [
 
 lazy_static! {
     static ref TARGET_RE: Regex = Regex::new(r"^\d+:[0-9a-f]{64}:.+$").unwrap();
+    static ref LAST_STATS_AT: Mutex<u64> = Mutex::new(0);
 }
 
 /// Author pubkey of a well-formed visit target
@@ -59,6 +62,31 @@ fn custom_tag(name: &str, values: &[&str]) -> Tag {
     )
 }
 
+fn sign_event(
+    keys: &Keys,
+    created_at: u64,
+    kind: Kind,
+    tags: Vec<Tag>,
+) -> std::result::Result<nostr::Event, nostr::event::builder::Error> {
+    let secp = Secp256k1::new();
+    let keypair = &keys.key_pair()?;
+    let pubkey = keys.public_key();
+    let created_at = Timestamp::from(created_at);
+    let content = String::new();
+    let id = EventId::new(&pubkey, created_at, &kind, &tags, &content);
+    let message = Message::from_slice(id.as_bytes())?;
+    Ok(nostr::Event {
+        id,
+        pubkey,
+        created_at,
+        kind,
+        tags,
+        content,
+        sig: secp.sign_schnorr(&message, keypair),
+        ots: None,
+    })
+}
+
 /// Count a visit and, if it counted, publish the daily and total statistics
 pub async fn count_visit(
     repo: &Arc<dyn NostrRepo>,
@@ -81,6 +109,7 @@ pub async fn count_visit(
         return Ok(false);
     }
     let day_start = hour - hour % DAY_SECONDS;
+    let mut last_stats_at = LAST_STATS_AT.lock().await;
     let (hourly, total) = repo.visit_stats(target, day_start).await?;
     let day = Utc
         .timestamp_opt(day_start as i64, 0)
@@ -112,9 +141,10 @@ pub async fn count_visit(
     ];
 
     for tags in [daily_tags, total_tags] {
-        let stats_event: Event = EventBuilder::new(Kind::Custom(STATS_KIND), "", &tags)
-            .to_event(keys)?
-            .into();
+        let created_at = unix_time().max(*last_stats_at + 1);
+        *last_stats_at = created_at;
+        let stats_event: Event =
+            sign_event(keys, created_at, Kind::Custom(STATS_KIND), tags)?.into();
         repo.write_event(&stats_event).await?;
         bcast_tx.send(stats_event).ok();
     }
@@ -159,6 +189,7 @@ mod tests {
     use super::*;
     use crate::repo::sqlite::SqliteRepo;
     use crate::server::create_metrics;
+    use crate::subscription::Subscription;
     use tokio::sync::broadcast;
 
     const AUTHOR_SK: &str = "0000000000000000000000000000000000000000000000000000000000000002";
@@ -300,6 +331,47 @@ mod tests {
                 .unwrap()
         );
         assert!(bcast_rx.try_recv().is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn two_visits_in_same_second_are_both_reflected_in_stored_daily_event() {
+        let (repo, dir) = test_repo().await;
+        let (bcast_tx, _bcast_rx) = broadcast::channel(8);
+        let keys = Keys::from_sk_str(RELAY_SK).unwrap();
+        let t = target();
+        let pk = pubkey(VISITOR_SK);
+        let other_pk = pubkey(OTHER_VISITOR_SK);
+        assert!(
+            count_visit(&repo, &keys, &bcast_tx, &t, Some(&pk), "10.0.0.1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            count_visit(&repo, &keys, &bcast_tx, &t, Some(&other_pk), "10.0.0.2")
+                .await
+                .unwrap()
+        );
+
+        let sub: Subscription = serde_json::from_str(&format!(
+            "[\"REQ\",\"stats\",{{\"kinds\":[{STATS_KIND}],\"#a\":[\"{t}\"]}}]"
+        ))
+        .unwrap();
+        let (query_tx, mut query_rx) = tokio::sync::mpsc::channel(8);
+        let (_abandon_tx, abandon_rx) = tokio::sync::oneshot::channel();
+        repo.query_subscription(sub, "client".to_owned(), query_tx, abandon_rx)
+            .await
+            .unwrap();
+        let mut totals = vec![];
+        while let Some(result) = query_rx.recv().await {
+            if result.event == "EOSE" {
+                continue;
+            }
+            let stored: Event = serde_json::from_str(&result.event).unwrap();
+            totals.push(stored.tag_values_by_name("total"));
+        }
+        totals.sort();
+        assert_eq!(totals, vec![vec!["2".to_owned()], vec!["2".to_owned()]]);
         std::fs::remove_dir_all(dir).ok();
     }
 

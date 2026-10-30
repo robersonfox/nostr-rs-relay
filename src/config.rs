@@ -1,6 +1,7 @@
 //! Configuration file and settings management
 use crate::payment::Processor;
 use config::{Config, ConfigError, File};
+use nostr::key::{FromSkStr, Keys};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -289,8 +290,8 @@ impl Settings {
                     .visits
                     .secret_key
                     .as_ref()
-                    .is_some_and(|key| key != "<nostr nsec>"),
-                "Visits require a secret_key"
+                    .is_some_and(|key| Keys::from_sk_str(key).is_ok()),
+                "Visits require a valid secret_key"
             );
         }
 
