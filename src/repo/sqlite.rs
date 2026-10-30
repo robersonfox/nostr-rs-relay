@@ -245,6 +245,34 @@ impl SqliteRepo {
         tx.commit()?;
         Ok(ins_count)
     }
+
+    /// Register a visit, returning whether it was counted.
+    pub fn persist_visit(
+        conn: &mut PooledConnection,
+        target: &str,
+        pubkey: Option<&str>,
+        ip: &str,
+        hour: u64,
+    ) -> Result<bool> {
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM visit_seen WHERE hour < ?1;", params![hour])?;
+        let insert_seen =
+            "INSERT OR IGNORE INTO visit_seen (target, hour, who) VALUES (?1, ?2, ?3);";
+        let mut counted = tx.execute(insert_seen, params![target, hour, format!("ip:{ip}")])? == 1;
+        if let Some(pubkey) = pubkey {
+            let new_pubkey =
+                tx.execute(insert_seen, params![target, hour, format!("pk:{pubkey}")])? == 1;
+            counted = counted && new_pubkey;
+        }
+        if counted {
+            tx.execute(
+                "INSERT INTO visit_hourly (target, hour, count) VALUES (?1, ?2, 1) ON CONFLICT(target, hour) DO UPDATE SET count = count + 1;",
+                params![target, hour],
+            )?;
+        }
+        tx.commit()?;
+        Ok(counted)
+    }
 }
 
 #[async_trait]
@@ -880,6 +908,48 @@ impl NostrRepo for SqliteRepo {
             tx.commit()?;
             let ok: Result<String> = Ok(pubkey);
             ok
+        })
+        .await?
+    }
+
+    async fn record_visit(
+        &self,
+        target: &str,
+        pubkey: Option<&str>,
+        ip: &str,
+        hour: u64,
+    ) -> Result<bool> {
+        let _write_guard = self.write_in_progress.lock().await;
+        let pool = self.write_pool.clone();
+        let target = target.to_owned();
+        let pubkey = pubkey.map(str::to_owned);
+        let ip = ip.to_owned();
+        task::spawn_blocking(move || {
+            let mut conn = pool.get()?;
+            SqliteRepo::persist_visit(&mut conn, &target, pubkey.as_deref(), &ip, hour)
+        })
+        .await?
+    }
+
+    async fn visit_stats(&self, target: &str, day_start: u64) -> Result<(Vec<(u64, u64)>, u64)> {
+        let pool = self.read_pool.clone();
+        let target = target.to_owned();
+        task::spawn_blocking(move || {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT hour, count FROM visit_hourly WHERE target = ?1 AND hour >= ?2 AND hour < ?3 ORDER BY hour;",
+            )?;
+            let hourly = stmt
+                .query_map(params![target, day_start, day_start + 86400], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let total = conn.query_row(
+                "SELECT COALESCE(SUM(count), 0) FROM visit_hourly WHERE target = ?1;",
+                params![target],
+                |row| row.get::<_, u64>(0),
+            )?;
+            Ok((hourly, total))
         })
         .await?
     }

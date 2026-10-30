@@ -684,6 +684,24 @@ ON CONFLICT (id) DO NOTHING"#,
 
     /// Get the most recent invoice for a given pubkey
     /// invoice must be unpaid and not expired
+    async fn record_visit(
+        &self,
+        _target: &str,
+        _pubkey: Option<&str>,
+        _ip: &str,
+        _hour: u64,
+    ) -> Result<bool> {
+        Err(error::Error::CustomError(
+            "visit counter is not supported on postgres".to_owned(),
+        ))
+    }
+
+    async fn visit_stats(&self, _target: &str, _day_start: u64) -> Result<(Vec<(u64, u64)>, u64)> {
+        Err(error::Error::CustomError(
+            "visit counter is not supported on postgres".to_owned(),
+        ))
+    }
+
     async fn get_unpaid_invoice(&self, pubkey: &Keys) -> Result<Option<InvoiceInfo>> {
         let query = r#"
 SELECT amount, payment_hash, description, invoice

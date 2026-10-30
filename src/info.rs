@@ -1,6 +1,7 @@
 //! Relay metadata using NIP-11
 /// Relay Info
 use crate::config::Settings;
+use nostr::key::{FromSkStr, Keys};
 use serde::{Deserialize, Serialize};
 
 pub const CARGO_PKG_VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
@@ -61,6 +62,8 @@ pub struct RelayInfo {
     pub payment_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fees: Option<Fees>,
+    #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
+    pub relay_self: Option<String>,
 }
 
 /// Convert an Info configuration into public Relay Info
@@ -75,6 +78,16 @@ impl From<Settings> for RelayInfo {
 
         let i = c.info;
         let p = c.pay_to_relay;
+
+        let relay_self = if c.visits.enabled {
+            c.visits
+                .secret_key
+                .as_deref()
+                .and_then(|k| Keys::from_sk_str(k).ok())
+                .map(|keys| keys.public_key().to_string())
+        } else {
+            None
+        };
 
         let limitations = Limitation {
             payment_required: Some(p.enabled),
@@ -136,6 +149,7 @@ impl From<Settings> for RelayInfo {
             payment_url,
             fees,
             icon: i.relay_icon,
+            relay_self,
         }
     }
 }

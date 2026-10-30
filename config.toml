@@ -251,3 +251,12 @@ limit_scrapers = false
 
 # optional if `direct_message=false`
 #secret_key = "<nostr nsec>"
+
+[visits]
+# Count visits to addressable events and publish the statistics.
+# Requires `nip42_auth = true` in [authorization]; behind a proxy, also
+# set `remote_ip_header` in [network].
+#enabled = false
+
+# Secret key (hex or nsec) used to sign the statistics events
+#secret_key = "<nostr nsec>"

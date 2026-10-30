@@ -19,6 +19,7 @@ use crate::repo::NostrRepo;
 use crate::server::Error::CommandUnknownError;
 use crate::server::EventWrapper::{WrappedAuth, WrappedEvent};
 use crate::subscription::Subscription;
+use crate::visit;
 use futures::SinkExt;
 use futures::StreamExt;
 use governor::{Jitter, Quota, RateLimiter};
@@ -262,6 +263,18 @@ async fn handle_web_request(
                 .status(StatusCode::OK)
                 .body(Body::from("ok"))
                 .unwrap())
+        }
+        ("/visit", false) if settings.visits.enabled => {
+            let ip = settings
+                .network
+                .remote_ip_header
+                .as_ref()
+                .and_then(|x| get_header_string(x, request.headers()))
+                .unwrap_or_else(|| remote_addr.ip().to_string());
+            Ok(
+                visit::handle_request(request.uri().query(), &ip, &repo, &settings, &broadcast)
+                    .await,
+            )
         }
         // Endpoint for relays terms
         ("/terms", false) => Ok(Response::builder()
@@ -693,7 +706,7 @@ async fn ctrl_c_or_signal(mut shutdown_signal: Receiver<()>) {
     }
 }
 
-fn create_metrics() -> (Registry, NostrMetrics) {
+pub(crate) fn create_metrics() -> (Registry, NostrMetrics) {
     // setup prometheus registry
     let registry = Registry::new();
 
@@ -1058,16 +1071,22 @@ fn make_notice_message(notice: &Notice) -> Message {
 
 fn allowed_to_send(event_str: &str, conn: &conn::ClientConn, settings: &Settings) -> bool {
     // TODO: pass in kind so that we can avoid deserialization for most events
-    if settings.authorization.nip42_dms {
+    if settings.authorization.nip42_dms || settings.visits.enabled {
         match serde_json::from_str::<Event>(event_str) {
             Ok(event) => {
-                if event.kind == 4 || event.kind == 44 || event.kind == 1059 {
+                if settings.authorization.nip42_dms
+                    && (event.kind == 4 || event.kind == 44 || event.kind == 1059)
+                {
                     match (conn.auth_pubkey(), event.tag_values_by_name("p").first()) {
                         (Some(auth_pubkey), Some(recipient_pubkey)) => {
                             recipient_pubkey == auth_pubkey || &event.pubkey == auth_pubkey
                         }
                         (_, _) => false,
                     }
+                } else if settings.visits.enabled && event.kind == visit::STATS_KIND {
+                    conn.auth_pubkey().is_some_and(|auth_pubkey| {
+                        event.tag_values_by_name("p").first() == Some(auth_pubkey)
+                    })
                 } else {
                     true
                 }
@@ -1542,4 +1561,86 @@ pub struct NostrMetrics {
     pub cmd_event: IntCounter,       // count of EVENT commands received
     pub cmd_close: IntCounter,       // count of CLOSE commands received
     pub cmd_auth: IntCounter,        // count of AUTH commands received
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::event::tag::TagKind;
+    use nostr::key::FromSkStr;
+    use nostr::{EventBuilder, Kind, Tag};
+
+    const AUTHOR_SK: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+    const RELAY_SK: &str = "0000000000000000000000000000000000000000000000000000000000000003";
+    const OTHER_SK: &str = "0000000000000000000000000000000000000000000000000000000000000004";
+    const RELAY_URL: &str = "ws://localhost";
+
+    fn keys(sk: &str) -> Keys {
+        Keys::from_sk_str(sk).unwrap()
+    }
+
+    fn stats_event_json() -> String {
+        let p_tag = Tag::Generic(
+            TagKind::Custom("p".to_owned()),
+            vec![keys(AUTHOR_SK).public_key().to_string()],
+        );
+        let event: Event = EventBuilder::new(Kind::Custom(visit::STATS_KIND), "", &[p_tag])
+            .to_event(&keys(RELAY_SK))
+            .unwrap()
+            .into();
+        serde_json::to_string(&event).unwrap()
+    }
+
+    fn conn_authenticated_as(sk: Option<&str>) -> conn::ClientConn {
+        let mut conn = conn::ClientConn::new("10.0.0.1".to_owned());
+        if let Some(sk) = sk {
+            conn.generate_auth_challenge();
+            let challenge = conn.auth_challenge().cloned().unwrap();
+            let auth_event: Event =
+                EventBuilder::auth(challenge, nostr::Url::parse(RELAY_URL).unwrap())
+                    .to_event(&keys(sk))
+                    .unwrap()
+                    .into();
+            conn.authenticate(&auth_event, RELAY_URL).unwrap();
+        }
+        conn
+    }
+
+    fn visits_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.authorization.nip42_auth = true;
+        settings.visits.enabled = true;
+        settings.visits.secret_key = Some(RELAY_SK.to_owned());
+        settings
+    }
+
+    #[test]
+    fn stats_event_is_not_sent_without_auth() {
+        let conn = conn_authenticated_as(None);
+        assert!(!allowed_to_send(
+            &stats_event_json(),
+            &conn,
+            &visits_settings()
+        ));
+    }
+
+    #[test]
+    fn stats_event_is_sent_to_authenticated_author() {
+        let conn = conn_authenticated_as(Some(AUTHOR_SK));
+        assert!(allowed_to_send(
+            &stats_event_json(),
+            &conn,
+            &visits_settings()
+        ));
+    }
+
+    #[test]
+    fn stats_event_is_not_sent_to_other_authenticated_key() {
+        let conn = conn_authenticated_as(Some(OTHER_SK));
+        assert!(!allowed_to_send(
+            &stats_event_json(),
+            &conn,
+            &visits_settings()
+        ));
+    }
 }

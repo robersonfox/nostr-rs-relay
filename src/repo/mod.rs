@@ -86,6 +86,19 @@ pub trait NostrRepo: Send + Sync {
     /// Get the most recent invoice for a given pubkey
     /// invoice must be unpaid and not expired
     async fn get_unpaid_invoice(&self, pubkey: &Keys) -> Result<Option<InvoiceInfo>>;
+
+    /// Register a visit to `target` during `hour`, returning whether it was counted.
+    /// A visit is not counted if the pubkey or the IP was already seen for the target in the hour.
+    async fn record_visit(
+        &self,
+        target: &str,
+        pubkey: Option<&str>,
+        ip: &str,
+        hour: u64,
+    ) -> Result<bool>;
+
+    /// Visits per hour of the day starting at `day_start`, and the all-time total
+    async fn visit_stats(&self, target: &str, day_start: u64) -> Result<(Vec<(u64, u64)>, u64)>;
 }
 
 // Current time, with a slight forward jitter in seconds

@@ -104,6 +104,13 @@ pub struct PayToRelay {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(unused)]
+pub struct Visits {
+    pub enabled: bool,
+    pub secret_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(unused)]
 pub struct Diagnostics {
     pub tracing: bool, // enables tokio console-subscriber
 }
@@ -188,6 +195,7 @@ pub struct Settings {
     pub limits: Limits,
     pub authorization: Authorization,
     pub pay_to_relay: PayToRelay,
+    pub visits: Visits,
     pub verified_users: VerifiedUsers,
     pub retention: Retention,
     pub options: Options,
@@ -271,6 +279,21 @@ impl Settings {
             }
         }
 
+        if settings.visits.enabled {
+            assert!(
+                settings.authorization.nip42_auth,
+                "Visits require nip42_auth to be enabled"
+            );
+            assert!(
+                settings
+                    .visits
+                    .secret_key
+                    .as_ref()
+                    .is_some_and(|key| key != "<nostr nsec>"),
+                "Visits require a secret_key"
+            );
+        }
+
         Ok(settings)
     }
 }
@@ -339,6 +362,10 @@ impl Default for Settings {
                 direct_message: false,
                 secret_key: None,
                 processor: Processor::LNBits,
+            },
+            visits: Visits {
+                enabled: false,
+                secret_key: None,
             },
             verified_users: VerifiedUsers {
                 mode: VerifiedUsersMode::Disabled,

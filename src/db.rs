@@ -9,10 +9,12 @@ use crate::repo::postgres::{PostgresPool, PostgresRepo};
 use crate::repo::sqlite::SqliteRepo;
 use crate::repo::NostrRepo;
 use crate::server::NostrMetrics;
+use crate::visit;
 use governor::clock::Clock;
 use governor::{Quota, RateLimiter};
 use log::LevelFilter;
 use nostr::key::FromPkStr;
+use nostr::key::FromSkStr;
 use nostr::key::Keys;
 use r2d2;
 use sqlx::pool::PoolOptions;
@@ -116,6 +118,16 @@ pub async fn db_writer(
     let pay_to_relay_enabled = settings.pay_to_relay.enabled;
     let cost_per_event = settings.pay_to_relay.cost_per_event;
     debug!("Pay to relay: {}", pay_to_relay_enabled);
+
+    let visit_keys = if settings.visits.enabled {
+        settings
+            .visits
+            .secret_key
+            .as_deref()
+            .and_then(|key| Keys::from_sk_str(key).ok())
+    } else {
+        None
+    };
 
     //upgrade_db(&mut pool.get()?)?;
 
@@ -391,6 +403,27 @@ pub async fn db_writer(
         }
 
         // TODO: cache recent list of authors to remove a DB call.
+        if let Some(keys) = &visit_keys {
+            if event.kind == visit::VISIT_KIND {
+                if let Some(target) = visit::visit_target(&event) {
+                    if let Err(e) = visit::count_visit(
+                        &repo,
+                        keys,
+                        &bcast_tx,
+                        &target,
+                        Some(&event.pubkey),
+                        &subm_event.source_ip,
+                    )
+                    .await
+                    {
+                        warn!("visit counting failed: {:?}", e);
+                    }
+                }
+                notice_tx.try_send(Notice::saved(event.id)).ok();
+                continue;
+            }
+        }
+
         let start = Instant::now();
         if event.is_ephemeral() {
             bcast_tx.send(event.clone()).ok();
